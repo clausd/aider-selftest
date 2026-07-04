@@ -215,6 +215,18 @@ def main(
     exercises_dir: str = typer.Option(
         EXERCISES_DIR_DEFAULT, "--exercises-dir", help="Directory with exercise files"
     ),
+    test_mode: str = typer.Option(
+        "vanilla", "--test-mode",
+        help="vanilla | dryrun | selftest (selftest is v2, not yet implemented)",
+    ),
+    dryrun_loops: int = typer.Option(
+        3, "--dryrun-loops",
+        help="Max iterations of stripped-test feedback in dryrun mode",
+    ),
+    stripped_tests_dir: Optional[str] = typer.Option(
+        None, "--stripped-tests-dir",
+        help="Path to polyglot-benchmark-stripped fork (required if test-mode=dryrun)",
+    ),
 ):
     repo = git.Repo(search_parent_directories=True)
     commit_hash = repo.head.object.hexsha[:7]
@@ -248,6 +260,16 @@ def main(
 
     assert len(updated_dirnames) == 1, updated_dirnames
     dirname = updated_dirnames[0]
+
+    if test_mode not in {"vanilla", "dryrun", "selftest"}:
+        print(f"unknown --test-mode {test_mode!r}, must be vanilla|dryrun|selftest")
+        return 1
+    if test_mode == "selftest":
+        print("--test-mode selftest is not implemented yet")
+        return 1
+    if test_mode == "dryrun" and not stripped_tests_dir:
+        print("--test-mode dryrun requires --stripped-tests-dir")
+        return 1
 
     if "AIDER_DOCKER" not in os.environ:
         print("Warning: benchmarking runs unvetted code from GPT, run in a docker container")
@@ -370,6 +392,9 @@ def main(
                 sleep,
                 reasoning_effort,
                 thinking_tokens,
+                test_mode,
+                dryrun_loops,
+                stripped_tests_dir,
             )
 
             all_results.append(results)
@@ -396,6 +421,9 @@ def main(
                 sleep,
                 reasoning_effort,
                 thinking_tokens,
+                test_mode,
+                dryrun_loops,
+                stripped_tests_dir,
             )
         all_results = run_test_threaded.gather(tqdm=True)
 
@@ -693,6 +721,9 @@ def run_test_real(
     sleep=0,
     reasoning_effort: Optional[str] = None,
     thinking_tokens: Optional[int] = None,
+    test_mode: str = "vanilla",
+    dryrun_loops: int = 3,
+    stripped_tests_dir: Optional[str] = None,
     read_model_settings=None,
 ):
     if not os.path.isdir(testdir):
@@ -845,7 +876,7 @@ def run_test_real(
 
     dur = 0
     test_outcomes = []
-    for i in range(tries):
+    for i in range(dryrun_loops if test_mode == "dryrun" else tries):
         start = time.time()
 
         if no_aider:
@@ -878,7 +909,13 @@ def run_test_real(
             break
 
         try:
-            errors = run_unit_tests(original_dname, testdir, history_fname, test_files)
+            # dryrun mode: use stripped tests during the tries loop; real
+            # tests are run once after the loop for grading.
+            unit_source = stripped_tests_dir if test_mode == "dryrun" else None
+            errors = run_unit_tests(
+                original_dname, testdir, history_fname, test_files,
+                test_source_dir=unit_source,
+            )
         except subprocess.TimeoutExpired:
             # try:
             #    errors = run_unit_tests(original_dname, testdir, history_fname, test_files)
@@ -903,7 +940,29 @@ def run_test_real(
         print(errors[-1])
         errors = "\n".join(errors)
         instructions = errors
-        instructions += prompts.test_failures.format(file_list=file_list)
+        if test_mode == "dryrun":
+            instructions += prompts.dryrun_feedback.format(file_list=file_list)
+        else:
+            instructions += prompts.test_failures.format(file_list=file_list)
+
+    # dryrun mode: internal loop scored against stripped tests; now run
+    # the real (unstripped) tests once to record the ground-truth outcome.
+    dryrun_iterations = len(test_outcomes)
+    dryrun_final_pass = bool(test_outcomes and test_outcomes[-1])
+    real_test_outcome = None
+    if test_mode == "dryrun":
+        try:
+            real_errors = run_unit_tests(
+                original_dname, testdir, history_fname, test_files,
+                test_source_dir=None,
+            )
+        except subprocess.TimeoutExpired:
+            real_errors = "Real tests timed out"
+            timeouts += 1
+        real_test_outcome = not bool(real_errors)
+        # Overwrite test_outcomes so the final pass@1 stat reflects the
+        # ground-truth grading, not the intermediate dryrun feedback loop.
+        test_outcomes = [real_test_outcome]
 
     # Clean up build directories after all attempts
     # Rust target/debug
@@ -966,6 +1025,10 @@ def run_test_real(
                 coder.chat_completion_response_hashes,
             )
         ),
+        test_mode=test_mode,
+        dryrun_iterations=dryrun_iterations if test_mode == "dryrun" else None,
+        dryrun_final_pass=dryrun_final_pass if test_mode == "dryrun" else None,
+        real_test_outcome=real_test_outcome,
     )
 
     if edit_format == "architect":
@@ -978,7 +1041,7 @@ def run_test_real(
     return results
 
 
-def run_unit_tests(original_dname, testdir, history_fname, test_files):
+def run_unit_tests(original_dname, testdir, history_fname, test_files, test_source_dir=None):
     timeout = 60 * 3
 
     # Map of file extensions to test commands
@@ -1004,9 +1067,12 @@ def run_unit_tests(original_dname, testdir, history_fname, test_files):
     if not command:
         raise ValueError(f"No test command found for files with extensions: {extensions}")
 
-    # Copy test files from original directory
+    # Copy test files from the chosen source directory (test_source_dir
+    # overrides original_dname for dryrun mode where we point at the
+    # stripped-tests fork instead of the vanilla polyglot repo).
+    source_root = Path(test_source_dir) if test_source_dir else original_dname
     for file_path in test_files:
-        src = original_dname / Path(*testdir.parts[-4:]) / file_path
+        src = source_root / Path(*testdir.parts[-4:]) / file_path
         dst = testdir / file_path
         if src.exists():
             print("copying", src, dst)
