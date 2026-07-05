@@ -264,8 +264,8 @@ def main(
     if test_mode not in {"vanilla", "dryrun", "selftest"}:
         print(f"unknown --test-mode {test_mode!r}, must be vanilla|dryrun|selftest")
         return 1
-    if test_mode == "selftest":
-        print("--test-mode selftest is not implemented yet")
+    if test_mode == "selftest" and not stripped_tests_dir:
+        print("--test-mode selftest requires --stripped-tests-dir")
         return 1
     if test_mode == "dryrun" and not stripped_tests_dir:
         print("--test-mode dryrun requires --stripped-tests-dir")
@@ -800,6 +800,21 @@ def run_test_real(
         else:
             print(f"Warning: Solution file not found: {src}")
 
+    # In selftest mode, seed the stripped test skeleton in testdir and
+    # add the test files to aider's editable set so the model can author
+    # its own assertions. Skip the per-iteration test-file copy done by
+    # run_unit_tests so the model's edits persist across loop iterations.
+    test_fnames = []
+    if test_mode == "selftest" and stripped_tests_dir:
+        for tf in test_files:
+            src_path = Path(stripped_tests_dir) / Path(*testdir.parts[-4:]) / tf
+            dst_path = testdir / tf
+            if src_path.exists():
+                os.makedirs(dst_path.parent, exist_ok=True)
+                shutil.copy(src_path, dst_path)
+                fnames.append(dst_path)
+                test_fnames.append(dst_path)
+
     file_list = " ".join(fname.name for fname in fnames)
 
     instructions = ""
@@ -812,7 +827,13 @@ def run_test_real(
     if instructions_append.exists():
         instructions += instructions_append.read_text()
 
-    instructions += prompts.instructions_addendum.format(file_list=file_list)
+    if test_mode == "selftest":
+        test_file_list = " ".join(Path(f).name for f in test_files)
+        instructions += prompts.selftest_setup.format(
+            file_list=file_list, test_file_list=test_file_list
+        )
+    else:
+        instructions += prompts.instructions_addendum.format(file_list=file_list)
 
     io = InputOutput(
         pretty=False,
@@ -876,7 +897,7 @@ def run_test_real(
 
     dur = 0
     test_outcomes = []
-    for i in range(dryrun_loops if test_mode == "dryrun" else tries):
+    for i in range(dryrun_loops if test_mode in ("dryrun", "selftest") else tries):
         start = time.time()
 
         if no_aider:
@@ -912,9 +933,10 @@ def run_test_real(
             # dryrun mode: use stripped tests during the tries loop; real
             # tests are run once after the loop for grading.
             unit_source = stripped_tests_dir if test_mode == "dryrun" else None
+            skip_copy = (test_mode == "selftest")
             errors = run_unit_tests(
                 original_dname, testdir, history_fname, test_files,
-                test_source_dir=unit_source,
+                test_source_dir=unit_source, copy_tests=(not skip_copy),
             )
         except subprocess.TimeoutExpired:
             # try:
@@ -942,15 +964,22 @@ def run_test_real(
         instructions = errors
         if test_mode == "dryrun":
             instructions += prompts.dryrun_feedback.format(file_list=file_list)
+        elif test_mode == "selftest":
+            test_file_list = " ".join(Path(f).name for f in test_files)
+            instructions += prompts.selftest_feedback.format(
+                file_list=file_list, test_file_list=test_file_list
+            )
         else:
             instructions += prompts.test_failures.format(file_list=file_list)
 
-    # dryrun mode: internal loop scored against stripped tests; now run
-    # the real (unstripped) tests once to record the ground-truth outcome.
+    # dryrun/selftest modes: internal loop scored against non-oracle
+    # feedback; now run the real (unstripped) tests once for grading.
     dryrun_iterations = len(test_outcomes)
     dryrun_final_pass = bool(test_outcomes and test_outcomes[-1])
+    selftest_iterations = dryrun_iterations if test_mode == "selftest" else None
+    selftest_final_pass = dryrun_final_pass if test_mode == "selftest" else None
     real_test_outcome = None
-    if test_mode == "dryrun":
+    if test_mode in ("dryrun", "selftest"):
         try:
             real_errors = run_unit_tests(
                 original_dname, testdir, history_fname, test_files,
@@ -1028,6 +1057,8 @@ def run_test_real(
         test_mode=test_mode,
         dryrun_iterations=dryrun_iterations if test_mode == "dryrun" else None,
         dryrun_final_pass=dryrun_final_pass if test_mode == "dryrun" else None,
+        selftest_iterations=selftest_iterations,
+        selftest_final_pass=selftest_final_pass,
         real_test_outcome=real_test_outcome,
     )
 
@@ -1041,7 +1072,7 @@ def run_test_real(
     return results
 
 
-def run_unit_tests(original_dname, testdir, history_fname, test_files, test_source_dir=None):
+def run_unit_tests(original_dname, testdir, history_fname, test_files, test_source_dir=None, copy_tests=True):
     timeout = 60 * 3
 
     # Map of file extensions to test commands
@@ -1070,14 +1101,17 @@ def run_unit_tests(original_dname, testdir, history_fname, test_files, test_sour
     # Copy test files from the chosen source directory (test_source_dir
     # overrides original_dname for dryrun mode where we point at the
     # stripped-tests fork instead of the vanilla polyglot repo).
+    # In selftest mode copy_tests=False so the model's authored assertions
+    # in the test file(s) are not overwritten each iteration.
     source_root = Path(test_source_dir) if test_source_dir else original_dname
-    for file_path in test_files:
-        src = source_root / Path(*testdir.parts[-4:]) / file_path
-        dst = testdir / file_path
-        if src.exists():
-            print("copying", src, dst)
-            os.makedirs(dst.parent, exist_ok=True)
-            shutil.copy(src, dst)
+    if copy_tests:
+        for file_path in test_files:
+            src = source_root / Path(*testdir.parts[-4:]) / file_path
+            dst = testdir / file_path
+            if src.exists():
+                print("copying", src, dst)
+                os.makedirs(dst.parent, exist_ok=True)
+                shutil.copy(src, dst)
 
     # Remove @Disabled annotations from Java test files
     for file_path in test_files:
