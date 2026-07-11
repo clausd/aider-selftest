@@ -121,3 +121,39 @@ The following was gathered in a research + planning phase before you started
 writing code. Use it as reference material; when in doubt, prefer the actual
 problem statement above.
 """
+
+
+# ---- strict-types mode (--strict-types) ----
+
+strict_types_addendum = """
+####
+
+# Strict-types mode
+
+Your solution must satisfy strict static type checking:
+
+- **Python**: pass `mypy --strict`. Every function signature (parameters and
+  return type) must be fully annotated. Do not use `typing.Any`. Prefer
+  precise generics (e.g. `list[int]`, `dict[str, int]`).
+- **JavaScript**: pass `tsc --allowJs --checkJs --strict --noEmit`. Every
+  exported function must have JSDoc parameter and return type annotations
+  (e.g. `@param {number} x`, `@returns {string[]}`).
+
+Do not change the public function or class names or the number/order of their
+parameters — the test suite is untouched from the baseline benchmark and
+depends on those identifiers.
+
+Static type errors will be reported before test failures. Fix type errors
+first, then test failures.
+"""
+
+
+strict_types_feedback_header = """
+####
+
+# Static type errors (fix these first)
+
+The static type checker reported the errors below. Fix them before making
+further changes to the solution's runtime behavior. The tests were not run
+this iteration because the code did not type-check.
+"""

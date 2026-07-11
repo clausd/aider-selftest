@@ -48,6 +48,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     npm init -y && \
     npm install \
     jest \
+    typescript@5.4.5 \
     @babel/core@7.25.2 \
     @exercism/babel-preset-javascript@0.2.1 \
     @exercism/eslint-config-javascript@0.6.0 \
@@ -59,6 +60,8 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 
 COPY . /aider
 RUN pip3 install --no-cache-dir --upgrade pip uv
+RUN pip3 install --no-cache-dir mypy==1.11.2
 RUN uv pip install --system --no-cache-dir -e /aider[dev]
 RUN git config --global --add safe.directory /aider
+ENV PATH="/npm-install/node_modules/.bin:$PATH"
 WORKDIR /aider

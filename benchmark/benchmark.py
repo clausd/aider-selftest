@@ -239,6 +239,10 @@ def main(
         None, "--research-log-root",
         help="Directory root where per-exercise research JSONL logs go (mirrors testdir)",
     ),
+    strict_types: bool = typer.Option(
+        False, "--strict-types",
+        help="Run mypy (Python) / tsc (JS) before tests. Errors feed back as high-priority feedback.",
+    ),
 ):
     repo = git.Repo(search_parent_directories=True)
     commit_hash = repo.head.object.hexsha[:7]
@@ -416,6 +420,7 @@ def main(
                 research_cycles,
                 research_tool_path,
                 research_log_root,
+                strict_types,
             )
 
             all_results.append(results)
@@ -448,6 +453,7 @@ def main(
                 research_cycles,
                 research_tool_path,
                 research_log_root,
+                strict_types,
             )
         all_results = run_test_threaded.gather(tqdm=True)
 
@@ -925,6 +931,7 @@ def run_test_real(
     research_cycles: int = 0,
     research_tool_path: Optional[str] = None,
     research_log_root: Optional[str] = None,
+    strict_types: bool = False,
     read_model_settings=None,
 ):
     if not os.path.isdir(testdir):
@@ -1059,6 +1066,10 @@ def run_test_real(
     else:
         instructions += prompts.instructions_addendum.format(file_list=file_list)
 
+    # Strict-types mode: model must produce mypy/tsc-clean code
+    if strict_types:
+        instructions += prompts.strict_types_addendum
+
     io = InputOutput(
         pretty=False,
         yes=True,
@@ -1158,10 +1169,17 @@ def run_test_real(
             # tests are run once after the loop for grading.
             unit_source = stripped_tests_dir if test_mode == "dryrun" else None
             skip_copy = (test_mode == "selftest")
-            errors = run_unit_tests(
-                original_dname, testdir, history_fname, test_files,
-                test_source_dir=unit_source, copy_tests=(not skip_copy),
-            )
+            static_errors = None
+            if strict_types:
+                static_errors = run_static_type_check(testdir, solution_files)
+            if static_errors:
+                # Feed static errors back; skip the test run this iteration.
+                errors = prompts.strict_types_feedback_header + "\n" + static_errors
+            else:
+                errors = run_unit_tests(
+                    original_dname, testdir, history_fname, test_files,
+                    test_source_dir=unit_source, copy_tests=(not skip_copy),
+                )
         except subprocess.TimeoutExpired:
             # try:
             #    errors = run_unit_tests(original_dname, testdir, history_fname, test_files)
@@ -1296,6 +1314,56 @@ def run_test_real(
     results_fname.write_text(json.dumps(results, indent=4))
 
     return results
+
+
+
+
+def run_static_type_check(testdir, solution_files):
+    """Run mypy (Python) or tsc (JavaScript) on the solution files. Returns a
+    string of combined error output, or None if all checks passed / no
+    supported files. Rust / Cpp / Go / Java are compile-checked by the test
+    runners themselves, so we skip static-only checks there."""
+    import subprocess as _sub
+    errors = []
+    for fp in solution_files:
+        p = testdir / fp
+        if not p.exists():
+            continue
+        suf = p.suffix.lower()
+        if suf == ".py":
+            try:
+                r = _sub.run(
+                    ["mypy", "--strict", "--no-color-output", "--no-error-summary",
+                     "--follow-imports=silent", "--show-column-numbers", str(p)],
+                    cwd=testdir, capture_output=True, text=True, timeout=60,
+                )
+                if r.returncode != 0:
+                    out = (r.stdout or "") + (r.stderr or "")
+                    # trim absolute paths for readability
+                    out = out.replace(str(testdir) + "/", "")
+                    errors.append(f"# mypy {p.name}\n{out.strip()}")
+            except Exception as e:
+                errors.append(f"# mypy tool failure: {e}")
+        elif suf == ".js":
+            try:
+                r = _sub.run(
+                    ["npx", "--no-install", "tsc",
+                     "--allowJs", "--checkJs", "--strict", "--noEmit",
+                     "--target", "es2020",
+                     "--moduleResolution", "node",
+                     "--esModuleInterop",
+                     str(p)],
+                    cwd=testdir, capture_output=True, text=True, timeout=90,
+                )
+                if r.returncode != 0:
+                    out = (r.stdout or "") + (r.stderr or "")
+                    out = out.replace(str(testdir) + "/", "")
+                    errors.append(f"# tsc {p.name}\n{out.strip()}")
+            except Exception as e:
+                errors.append(f"# tsc tool failure: {e}")
+    if not errors:
+        return None
+    return "\n\n".join(errors)
 
 
 def run_unit_tests(original_dname, testdir, history_fname, test_files, test_source_dir=None, copy_tests=True):
