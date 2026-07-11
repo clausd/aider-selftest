@@ -65,3 +65,59 @@ test output is above. Reconcile the two: either the solution is wrong, or
 your assertions encode a wrong understanding of the spec — decide which and
 fix it. Update {file_list} accordingly.
 """
+
+
+# ---- Research + plan phase (feeds an external Perplexity search tool) ----
+
+research_question_generator = """
+You are about to solve a programming exercise. Before writing any code, you may
+consult a general web search engine. Emit between 1 and 3 SHORT search queries
+(one per line, each prefixed with "QUERY: ") that would help you understand
+the algorithms, standard library APIs, or common patterns you might need.
+
+Rules for your queries:
+- Do NOT include the words: test, assert, expected, exercism, solution, kata.
+- Do NOT ask for the specific answer, expected output, lyrics, or reference
+  solution — the queries must be about general concepts, algorithms, or APIs.
+- Do NOT include the exercise name.
+- Focus on generic knowledge you'd look up in official docs or StackOverflow.
+- Keep each query under 12 words.
+
+The exercise description is below.
+
+---
+
+{instructions}
+
+---
+
+Emit only the QUERY lines; no other text.
+"""
+
+
+research_plan_prompt = """
+Below are the raw web-search results for the queries you asked. Use them to
+inform your understanding, but remember: the results are general references,
+not the specific solution.
+
+--- Search results ---
+
+{findings}
+
+--- Task ---
+
+Now write a concise, numbered plan (5 to 10 steps) for implementing the
+exercise. Do NOT write any code yet — just the plan. The plan will be used to
+guide the actual coding step immediately afterwards.
+"""
+
+
+research_context_header = """
+####
+
+# Research findings + plan (from a prior research phase)
+
+The following was gathered in a research + planning phase before you started
+writing code. Use it as reference material; when in doubt, prefer the actual
+problem statement above.
+"""

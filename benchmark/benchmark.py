@@ -227,6 +227,18 @@ def main(
         None, "--stripped-tests-dir",
         help="Path to polyglot-benchmark-stripped fork (required if test-mode=dryrun)",
     ),
+    research_cycles: int = typer.Option(
+        0, "--research-cycles",
+        help="If >0, run N research+plan cycles before the selftest loop",
+    ),
+    research_tool_path: Optional[str] = typer.Option(
+        None, "--research-tool-path",
+        help="Path to the research CLI (Perplexity wrapper) inside the container",
+    ),
+    research_log_root: Optional[str] = typer.Option(
+        None, "--research-log-root",
+        help="Directory root where per-exercise research JSONL logs go (mirrors testdir)",
+    ),
 ):
     repo = git.Repo(search_parent_directories=True)
     commit_hash = repo.head.object.hexsha[:7]
@@ -263,6 +275,12 @@ def main(
 
     if test_mode not in {"vanilla", "dryrun", "selftest"}:
         print(f"unknown --test-mode {test_mode!r}, must be vanilla|dryrun|selftest")
+        return 1
+    if research_cycles > 0 and not research_tool_path:
+        print("--research-cycles requires --research-tool-path")
+        return 1
+    if research_cycles > 0 and test_mode != "selftest":
+        print("--research-cycles is only supported with --test-mode selftest for now")
         return 1
     if test_mode == "selftest" and not stripped_tests_dir:
         print("--test-mode selftest requires --stripped-tests-dir")
@@ -395,6 +413,9 @@ def main(
                 test_mode,
                 dryrun_loops,
                 stripped_tests_dir,
+                research_cycles,
+                research_tool_path,
+                research_log_root,
             )
 
             all_results.append(results)
@@ -424,6 +445,9 @@ def main(
                 test_mode,
                 dryrun_loops,
                 stripped_tests_dir,
+                research_cycles,
+                research_tool_path,
+                research_log_root,
             )
         all_results = run_test_threaded.gather(tqdm=True)
 
@@ -691,6 +715,180 @@ def get_replayed_content(replay_dname, test_dname):
     return "".join(res)
 
 
+
+
+# --- research + plan pre-phase ---
+def do_research_and_plan(
+    model_name,
+    instructions_body,
+    testdir,
+    testcase,
+    research_cycles,
+    research_tool_path,
+    research_log_root,
+):
+    """Runs `research_cycles` research+plan cycles and returns (context_string, stats_dict).
+
+    context_string is prepended to the main coder instructions. stats_dict is
+    stored on the .aider.results.json for downstream analysis. All queries and
+    all raw search results are also persisted via the research tool (JSONL) and
+    a per-exercise `.research.json`.
+    """
+    import subprocess, json as _json, os as _os, re as _re, time as _time
+
+    # Direct LLM call (bypasses the coder edit machinery so nothing tries to
+    # apply the research turn's response as a file edit).
+    import litellm
+
+    per_ex_log_dir = None
+    if research_log_root:
+        per_ex_log_dir = Path(research_log_root)
+        per_ex_log_dir.mkdir(parents=True, exist_ok=True)
+        research_log_path = str(per_ex_log_dir / f"{testcase}.jsonl")
+    else:
+        research_log_path = str(testdir / ".research.jsonl")
+
+    banned = ["test", "assert", "expected", "exercism", "solution", "kata"]
+    banned_lower = [b.lower() for b in banned] + [testcase.lower()]
+
+    stats = {
+        "cycles_run": 0,
+        "queries": [],
+        "n_results_per_query": [],
+        "flagged_queries": [],  # queries that contained a banned term
+        "plan_char_len": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "cost": 0.0,
+        "duration": 0.0,
+    }
+
+    def _one_completion(messages, max_tokens):
+        t0 = _time.time()
+        resp = litellm.completion(
+            model=model_name,
+            messages=messages,
+            max_tokens=max_tokens,
+            timeout=120,
+        )
+        dur = _time.time() - t0
+        text = resp.choices[0].message.content or ""
+        usage = getattr(resp, "usage", None) or {}
+        pt = int(getattr(usage, "prompt_tokens", 0) or 0)
+        ct = int(getattr(usage, "completion_tokens", 0) or 0)
+        stats["prompt_tokens"] += pt
+        stats["completion_tokens"] += ct
+        try:
+            stats["cost"] += float(resp._hidden_params.get("response_cost", 0) or 0)
+        except Exception:
+            pass
+        stats["duration"] += dur
+        return text
+
+    def _parse_queries(text):
+        out = []
+        for line in (text or "").splitlines():
+            line = line.strip()
+            m = _re.match(r"(?i)^(?:query\s*[:\-]\s*|[-*•]\s*|\d+[.)]\s*)(.+)$", line)
+            if m:
+                q = m.group(1).strip().strip('"').strip("'")
+                if q and len(q) < 200:
+                    out.append(q)
+        return out[:3]
+
+    def _run_tool(query):
+        env = _os.environ.copy()
+        env["RESEARCH_LOG_PATH"] = research_log_path
+        env["RESEARCH_EXERCISE"] = testcase
+        try:
+            out = subprocess.check_output(
+                [research_tool_path, query],
+                env=env, timeout=45, text=True,
+            )
+            return _json.loads(out)
+        except Exception as e:
+            print(f"[research] tool call failed for query {query!r}: {e}")
+            return {"results": [], "error": str(e)}
+
+    accumulated_context_parts = []
+    conversation = []
+
+    for cycle in range(research_cycles):
+        # --- Ask for queries ---
+        q_user_msg = prompts.research_question_generator.format(
+            instructions=instructions_body,
+        )
+        conversation = [{"role": "user", "content": q_user_msg}]
+        q_text = _one_completion(conversation, max_tokens=600)
+        queries = _parse_queries(q_text)
+        if not queries:
+            # graceful degrade: no queries produced, skip cycle
+            print(f"[research] cycle {cycle}: no queries parsed from model output")
+            continue
+        conversation.append({"role": "assistant", "content": q_text})
+
+        # --- Ban check ---
+        cycle_findings = []
+        for q in queries:
+            ql = q.lower()
+            if any(b in ql for b in banned_lower):
+                stats["flagged_queries"].append(q)
+            stats["queries"].append(q)
+            res = _run_tool(q)
+            n_res = len(res.get("results", []))
+            stats["n_results_per_query"].append(n_res)
+            cycle_findings.append({"query": q, "results": res.get("results", [])})
+
+        # --- Format findings for the plan turn + for the coder ---
+        findings_lines = []
+        for f in cycle_findings:
+            findings_lines.append(f"### Query: {f['query']}")
+            for r in f["results"][:5]:
+                title = (r.get("title") or "").strip()
+                snip = (r.get("snippet") or "").strip()
+                url = (r.get("url") or "").strip()
+                # Truncate very long snippets to keep prompts manageable
+                if len(snip) > 900:
+                    snip = snip[:900] + "..."
+                findings_lines.append(f"- [{title}]({url})\n    {snip}")
+        findings_str = "\n".join(findings_lines)
+
+        # --- Ask for a plan ---
+        plan_user_msg = prompts.research_plan_prompt.format(
+            instructions=instructions_body,
+            findings=findings_str,
+        )
+        conversation.append({"role": "user", "content": plan_user_msg})
+        plan_text = _one_completion(conversation, max_tokens=1500)
+        conversation.append({"role": "assistant", "content": plan_text})
+        stats["plan_char_len"] += len(plan_text or "")
+
+        accumulated_context_parts.append(
+            prompts.research_context_header
+            + f"\n\n## Cycle {cycle + 1} — research findings\n\n"
+            + findings_str
+            + f"\n\n## Cycle {cycle + 1} — plan\n\n"
+            + (plan_text or "").strip()
+        )
+        stats["cycles_run"] += 1
+
+        # Also persist per-exercise .research.json for auditing/inspection
+        try:
+            (testdir / ".research.json").write_text(_json.dumps({
+                "testcase": testcase,
+                "cycles": [{"queries": [q for q in queries],
+                            "findings": cycle_findings,
+                            "plan": plan_text}],
+                "stats": stats,
+            }, indent=2))
+        except Exception:
+            pass
+
+    if not accumulated_context_parts:
+        return "", stats
+    return "\n\n".join(accumulated_context_parts), stats
+
+
 def run_test(original_dname, testdir, *args, **kwargs):
     try:
         return run_test_real(original_dname, testdir, *args, **kwargs)
@@ -724,6 +922,9 @@ def run_test_real(
     test_mode: str = "vanilla",
     dryrun_loops: int = 3,
     stripped_tests_dir: Optional[str] = None,
+    research_cycles: int = 0,
+    research_tool_path: Optional[str] = None,
+    research_log_root: Optional[str] = None,
     read_model_settings=None,
 ):
     if not os.path.isdir(testdir):
@@ -826,6 +1027,29 @@ def run_test_real(
     instructions_append = testdir / ".docs/instructions.append.md"
     if instructions_append.exists():
         instructions += instructions_append.read_text()
+
+    # Research + plan phase (before the coder gets started). We do this here
+    # so the resulting context becomes part of the very first user message the
+    # coder sees.
+    research_stats = None
+    if research_cycles > 0 and test_mode == "selftest":
+        try:
+            research_context, research_stats = do_research_and_plan(
+                model_name=model_name,
+                instructions_body=instructions,
+                testdir=testdir,
+                testcase=testdir.name,
+                research_cycles=research_cycles,
+                research_tool_path=research_tool_path,
+                research_log_root=research_log_root,
+            )
+            if research_context:
+                instructions = (
+                    research_context + "\n\n" + instructions
+                )
+        except Exception as e:
+            print(f"[research] failed for {testdir.name}: {e}")
+            research_stats = {"error": str(e)}
 
     if test_mode == "selftest":
         test_file_list = " ".join(Path(f).name for f in test_files)
@@ -1060,6 +1284,8 @@ def run_test_real(
         selftest_iterations=selftest_iterations,
         selftest_final_pass=selftest_final_pass,
         real_test_outcome=real_test_outcome,
+        research_cycles=research_cycles if research_cycles > 0 else None,
+        research_stats=research_stats,
     )
 
     if edit_format == "architect":
