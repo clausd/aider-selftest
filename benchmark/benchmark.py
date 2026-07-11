@@ -1347,7 +1347,7 @@ def run_static_type_check(testdir, solution_files):
         elif suf == ".js":
             try:
                 r = _sub.run(
-                    ["npx", "--no-install", "tsc",
+                    ["tsc",
                      "--allowJs", "--checkJs", "--strict", "--noEmit",
                      "--target", "es2020",
                      "--moduleResolution", "node",
