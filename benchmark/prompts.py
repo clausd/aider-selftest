@@ -157,3 +157,44 @@ The static type checker reported the errors below. Fix them before making
 further changes to the solution's runtime behavior. The tests were not run
 this iteration because the code did not type-check.
 """
+
+
+# ---- Critique + revise cycle (--critique-cycles) ----
+
+critique_prompt = """
+####
+
+Now take a critical second look at your solution above.
+
+Compare it line-by-line against the problem statement (the original instructions
+at the top of this conversation). List every place where your code might
+diverge from what the spec requires:
+
+- edge cases the spec mentions that your code does not visibly handle
+- constraints or invariants the spec states that your code does not enforce
+- specific wording in the spec that does not clearly map to a line of your code
+- outputs, formatting, or exceptions the spec calls for that your code produces
+  differently
+
+Do NOT restate the spec. Do NOT rewrite the code. Just enumerate the concerns
+you have about your own code, one per bullet. Be concrete: reference the
+specific spec phrase and the specific line of your code you are worried about.
+
+Emit only the bulleted list of concerns and nothing else — no code, no fences,
+no revised solution.
+"""
+
+
+revise_prompt = """
+####
+
+Now rewrite the solution to address the specific concerns you listed above.
+
+Rules:
+- Only fix issues you called out. Do not add features, options, or handling
+  the spec does not ask for.
+- Do not weaken or work around any test the spec implies.
+- Keep the public interface (function or class names, parameter names, return
+  shape) exactly as it is.
+- Emit only the updated solution file(s) in the standard fenced-code format.
+"""

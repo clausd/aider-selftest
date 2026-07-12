@@ -243,6 +243,10 @@ def main(
         False, "--strict-types",
         help="Run mypy (Python) / tsc (JS) before tests. Errors feed back as high-priority feedback.",
     ),
+    critique_cycles: int = typer.Option(
+        0, "--critique-cycles",
+        help="After the initial code turn, run N critique+revise pairs before the selftest loop.",
+    ),
 ):
     repo = git.Repo(search_parent_directories=True)
     commit_hash = repo.head.object.hexsha[:7]
@@ -421,6 +425,7 @@ def main(
                 research_tool_path,
                 research_log_root,
                 strict_types,
+                critique_cycles,
             )
 
             all_results.append(results)
@@ -454,6 +459,7 @@ def main(
                 research_tool_path,
                 research_log_root,
                 strict_types,
+                critique_cycles,
             )
         all_results = run_test_threaded.gather(tqdm=True)
 
@@ -932,6 +938,7 @@ def run_test_real(
     research_tool_path: Optional[str] = None,
     research_log_root: Optional[str] = None,
     strict_types: bool = False,
+    critique_cycles: int = 0,
     read_model_settings=None,
 ):
     if not os.path.isdir(testdir):
@@ -1132,6 +1139,7 @@ def run_test_real(
 
     dur = 0
     test_outcomes = []
+    critique_stats = {"cycles_run": 0, "critique_char_len": 0, "revise_char_len": 0}
     for i in range(dryrun_loops if test_mode in ("dryrun", "selftest") else tries):
         start = time.time()
 
@@ -1158,6 +1166,24 @@ def run_test_real(
             lazy_comments += len(re.findall(pat, response, re.MULTILINE))
             dump(lazy_comments)
 
+        # Critique + revise turns (only on iteration 0, only in selftest mode).
+        if (
+            critique_cycles > 0
+            and test_mode == "selftest"
+            and i == 0
+            and not no_aider
+            and not replay
+        ):
+            for _cy in range(critique_cycles):
+                try:
+                    crit_txt = coder.run(with_message=prompts.critique_prompt, preproc=False) or ""
+                    critique_stats["critique_char_len"] += len(crit_txt)
+                    rev_txt = coder.run(with_message=prompts.revise_prompt, preproc=False) or ""
+                    critique_stats["revise_char_len"] += len(rev_txt)
+                    critique_stats["cycles_run"] += 1
+                except Exception as _e:
+                    print(f"[critique] cycle {_cy} failed: {_e}")
+                    break
         if coder.last_keyboard_interrupt:
             raise KeyboardInterrupt
 
@@ -1304,6 +1330,8 @@ def run_test_real(
         real_test_outcome=real_test_outcome,
         research_cycles=research_cycles if research_cycles > 0 else None,
         research_stats=research_stats,
+        critique_cycles=critique_cycles if critique_cycles > 0 else None,
+        critique_stats=critique_stats if critique_cycles > 0 else None,
     )
 
     if edit_format == "architect":
